@@ -8,20 +8,23 @@
 struct ModuleInfo_t
 {
 	ModuleInfo_t() = default;
-	ModuleInfo_t(std::uintptr_t uAddress, std::string strPath)
+	ModuleInfo_t(std::uintptr_t uAddress, std::string strPath, std::size_t uSize = 0)
 	{
 		m_uAddress = uAddress;
 		m_strPath = strPath;
+		m_uSize = uSize;
 	}
 
 	~ModuleInfo_t()
 	{
 		m_uAddress = NULL;
 		m_strPath = "";
+		m_uSize = 0;
 	}
 
 	std::uintptr_t m_uAddress = NULL;
 	std::string m_strPath = "";
+	std::size_t m_uSize = 0;
 };
 
 // @Credits: Cazz ( https://github.com/cazzwastaken/pro-bhop/blob/master/cheat/memory.h )
@@ -85,6 +88,7 @@ public:
 			{
 				uModuleAddress = reinterpret_cast<std::uintptr_t>(entry.modBaseAddr);
 				strModulePath = std::string(entry.szExePath);
+				return ModuleInfo_t(uModuleAddress, strModulePath, static_cast<std::size_t>(entry.modBaseSize));
 				break;
 			}
 		}
@@ -92,7 +96,7 @@ public:
 		if (snapShot)
 			::CloseHandle(snapShot);
 
-		return ModuleInfo_t(uModuleAddress, strModulePath);
+		return ModuleInfo_t(uModuleAddress, strModulePath, 0);
 	}
 
 	// read process memory
