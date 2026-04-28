@@ -594,20 +594,28 @@ namespace senddump
 
 	// ── engine-authoritative flat list via CSendTablePrecalc ───────────────────
 	//
-	// Hypothesis (CS:S x64):
+	// Layout (CS:S x64), verified via ProbeSendTableLayout:
 	//   SendTable +0x18 = CSendTablePrecalc *m_pPrecalc
-	//   CSendTablePrecalc +0x00 = CUtlVector<const SendProp*> m_FlatProps
-	//     CUtlVector layout on x64:
-	//       +0x00 T*   m_pMemory
-	//       +0x08 int  m_nAllocationCount
-	//       +0x0C int  m_nGrowSize
-	//       +0x10 int  m_Size           (actual element count)
 	//
-	// ProbeSendTableLayout dumps raw bytes of SendTable + CSendTablePrecalc for a
-	// few tables (DT_CSPlayer etc.) so we can verify these offsets one more time.
+	//   CSendTablePrecalc (has vtable so first 8 bytes are the vptr):
+	//     +0x00 vtable ptr
+	//     +0x08 CUtlVector #1 (datatable-node list, small count)
+	//     +0x28 CUtlVector #2 (prop-proxy list, small count)
+	//     +0x48 CUtlVector #3 = m_FlatProps  (array of SendProp*)
+	//     +0x68 CUtlVector #4 = m_PropProxyIndices (byte[] same length)
+	//
+	//   CUtlVector<T> on x64 is 32 bytes:
+	//     +0x00 T*   m_pMemory        (CUtlMemory::m_pMemory)
+	//     +0x08 int  m_nAllocationCount
+	//     +0x0C int  m_nGrowSize
+	//     +0x10 int  m_Size
+	//     +0x14 int  <pad>
+	//     +0x18 T*   m_pElements      (debugger alias of m_pMemory)
+	//
+	// So m_FlatProps.m_pMemory = precalc+0x48, m_FlatProps.m_Size = precalc+0x58.
 	constexpr std::uintptr_t kSendTablePrecalc        = 0x18;
-	constexpr std::uintptr_t kPrecalcFlatPropsMemory  = 0x00;
-	constexpr std::uintptr_t kPrecalcFlatPropsSize    = 0x10;
+	constexpr std::uintptr_t kPrecalcFlatPropsMemory  = 0x48;
+	constexpr std::uintptr_t kPrecalcFlatPropsSize    = 0x58;
 
 	static bool g_stProbeDone = false;
 	void ProbeSendTableLayout(std::uintptr_t tableAddress, const std::string& tableName)
@@ -663,6 +671,15 @@ namespace senddump
 		float highValue;
 		int   numElements;
 		std::string name;
+
+		// For DPT_ARRAY (type=5): the element template prop, fetched via m_pArrayProp.
+		// hasElem == false for non-array props.
+		bool  hasElem = false;
+		int   elemType = 0;
+		int   elemFlags = 0;
+		int   elemBits = 0;
+		float elemLow = 0.0f;
+		float elemHigh = 0.0f;
 	};
 
 	// Read up to [cap] prop pointers from the precalc's m_FlatProps CUtlVector.
@@ -695,6 +712,22 @@ namespace senddump
 			const auto namePtr = g_Memory.Read<std::uintptr_t>(propAddr + kSendPropName);
 			s.name = g_Memory.ReadString(namePtr);
 			if (!IsValidReadString(s.name)) s.name = "?";
+
+			// For DPT_ARRAY props, fetch the element template via m_pArrayProp at +0x20.
+			// The Kotlin decoder needs these to read array values inline (count + elements).
+			if (s.type == 5)
+			{
+				const auto elemPropAddr = g_Memory.Read<std::uintptr_t>(propAddr + kSendPropArrayProp);
+				if (elemPropAddr)
+				{
+					s.hasElem   = true;
+					s.elemType  = g_Memory.Read<int>(elemPropAddr + kSendPropType);
+					s.elemFlags = g_Memory.Read<int>(elemPropAddr + kSendPropFlags) & ~kSpropInsideArray;
+					s.elemBits  = g_Memory.Read<int>(elemPropAddr + kSendPropBits);
+					s.elemLow   = g_Memory.Read<float>(elemPropAddr + kSendPropLowValue);
+					s.elemHigh  = g_Memory.Read<float>(elemPropAddr + kSendPropHighValue);
+				}
+			}
 
 			out.push_back(s);
 		}
@@ -752,8 +785,16 @@ namespace senddump
 					<< " high=" << s.highValue
 					<< " nElements=" << s.numElements
 					<< " dotName=" << s.name
-					<< " addr=0x" << std::hex << s.propAddress << std::dec
-					<< "\n";
+					<< " addr=0x" << std::hex << s.propAddress << std::dec;
+				if (s.hasElem)
+				{
+					out << " elemType=" << s.elemType
+						<< " elemFlags=0x" << std::hex << (s.elemFlags & ((1 << kSpropNumFlagBitsNetworked) - 1)) << std::dec
+						<< " elemBits=" << s.elemBits
+						<< " elemLow=" << std::fixed << std::setprecision(9) << s.elemLow
+						<< " elemHigh=" << s.elemHigh;
+				}
+				out << "\n";
 			}
 			if (slots.size() > 0) ++matchedCount;
 		}
