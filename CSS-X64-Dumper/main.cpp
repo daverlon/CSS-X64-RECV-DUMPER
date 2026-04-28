@@ -359,6 +359,41 @@ namespace senddump
 		int elementStride;
 	};
 
+	// One-time probe: dump every 4-byte slot of a DPT_ARRAY SendProp so we can
+	// find the real m_nElements offset on CS:S x64. Expected values:
+	//   m_hViewModel       = 2
+	//   m_flPoseParameter  = 24
+	//   m_iszOverlayNames  = 15
+	//   m_flOverlayTimes   = 15
+	//   m_ragAngles        = 24
+	//   m_ragPos           = 24
+	// Whichever offset consistently contains those values is m_nElements.
+	static int g_probeCount = 0;
+	void ProbeArrayProp(std::uintptr_t propAddress, const std::string& propName, const std::string& currentDT)
+	{
+		if (g_probeCount >= 10) return;
+		g_probeCount++;
+
+		std::ofstream probe("sendprop_layout_probe.txt", std::ios::app);
+		if (!probe.is_open()) return;
+
+		probe << "\n=== PROBE #" << g_probeCount << " DPT_ARRAY '" << propName
+			<< "' DT=" << currentDT
+			<< " addr=0x" << std::hex << propAddress << std::dec << " ===\n";
+
+		for (std::size_t off = 0; off < kSendPropStride; off += 4)
+		{
+			const auto asInt = g_Memory.Read<int>(propAddress + off);
+			const auto asUint = static_cast<std::uint32_t>(asInt);
+			probe << "  +0x" << std::hex << std::setw(2) << std::setfill('0') << off
+				<< std::dec << std::setfill(' ')
+				<< "  i32=" << std::setw(12) << asInt
+				<< "  u32=0x" << std::hex << std::setw(8) << std::setfill('0') << asUint << std::setfill(' ')
+				<< std::dec << "\n";
+		}
+		probe.close();
+	}
+
 	void BuildFlatPropsRecursive(std::uintptr_t tableAddress, std::vector<FlatProp>& flatProps, const std::string& currentDT, std::map<std::string, bool>& excludeMap)
 	{
 		if (!tableAddress)
@@ -379,6 +414,10 @@ namespace senddump
 
 			const int type = g_Memory.Read<int>(propAddress + kSendPropType);
 			const int flags = g_Memory.Read<int>(propAddress + kSendPropFlags);
+
+			// Probe first few DPT_ARRAY props to identify m_nElements offset.
+			if (type == 5)
+				ProbeArrayProp(propAddress, name, currentDT);
 
 			if (flags & kSpropExclude)
 			{
