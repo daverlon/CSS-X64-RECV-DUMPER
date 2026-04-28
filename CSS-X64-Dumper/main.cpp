@@ -20,13 +20,17 @@ namespace senddump
 	constexpr std::uintptr_t kSendTablePropCount = 0x8;
 	constexpr std::uintptr_t kSendTableName = 0x10;
 
+	// SendProp offsets (CS:S x64). Verified via ProbeArrayProp:
+	//   +0x20 = m_pArrayProp (element template, sits 0x80 before the DPT_ARRAY)
+	//   +0x30 = m_nElements  (e.g. m_hViewModel=2, m_flPoseParameter=24)
+	//   +0x34 = m_ElementStride (4/8/12 matching handle/float/vector)
 	constexpr std::uintptr_t kSendPropType = 0x10;
 	constexpr std::uintptr_t kSendPropBits = 0x14;
 	constexpr std::uintptr_t kSendPropLowValue = 0x18;
 	constexpr std::uintptr_t kSendPropHighValue = 0x1C;
-	constexpr std::uintptr_t kSendPropArrayProp = 0x18;
-	constexpr std::uintptr_t kSendPropNumElements = 0x28;
-	constexpr std::uintptr_t kSendPropElementStride = 0x2C;
+	constexpr std::uintptr_t kSendPropArrayProp = 0x20;
+	constexpr std::uintptr_t kSendPropNumElements = 0x30;
+	constexpr std::uintptr_t kSendPropElementStride = 0x34;
 	constexpr std::uintptr_t kSendPropExcludeDTName = 0x38;
 	constexpr std::uintptr_t kSendPropName = 0x48;
 	constexpr std::uintptr_t kSendPropFlags = 0x54;
@@ -446,6 +450,47 @@ namespace senddump
 				else
 				{
 					BuildFlatPropsRecursive(dataTablePtr, flatProps, tableName, excludeMap);
+				}
+			}
+			else if (type == 5)
+			{
+				// DPT_ARRAY: expand into numElements copies of the element prop
+				// (at m_pArrayProp, typically the SendProp immediately before this
+				// one carrying SPROP_INSIDEARRAY). Mirrors the engine's
+				// SendTable_BuildHierarchy behavior.
+				const auto elemPropAddr = g_Memory.Read<std::uintptr_t>(propAddress + kSendPropArrayProp);
+				const int  numElements   = g_Memory.Read<int>(propAddress + kSendPropNumElements);
+				const int  elementStride = g_Memory.Read<int>(propAddress + kSendPropElementStride);
+				if (!elemPropAddr || numElements <= 0 || numElements > 4096)
+					continue;
+
+				const int   elemType  = g_Memory.Read<int>(elemPropAddr + kSendPropType);
+				const int   elemFlags = g_Memory.Read<int>(elemPropAddr + kSendPropFlags) & ~kSpropInsideArray;
+				const int   elemBits  = g_Memory.Read<int>(elemPropAddr + kSendPropBits);
+				const float elemLow   = g_Memory.Read<float>(elemPropAddr + kSendPropLowValue);
+				const float elemHigh  = g_Memory.Read<float>(elemPropAddr + kSendPropHighValue);
+				const auto  elemProxy = g_Memory.Read<std::uintptr_t>(elemPropAddr + kSendPropProxyFn);
+				const int   arrayOff  = g_Memory.Read<int>(propAddress + kSendPropOffset);
+				const unsigned char arrayPriority = g_Memory.Read<unsigned char>(propAddress + kSendPropPriority);
+
+				for (int e = 0; e < numElements; ++e)
+				{
+					FlatProp fp;
+					fp.propAddress   = elemPropAddr;
+					fp.type          = elemType;
+					fp.flags         = elemFlags;
+					fp.bits          = elemBits;
+					fp.lowValue      = elemLow;
+					fp.highValue     = elemHigh;
+					fp.numElements   = 0;
+					fp.name          = name + "[" + std::to_string(e) + "]";
+					fp.originDT      = currentDT;
+					fp.offset        = arrayOff + e * elementStride;
+					fp.priority      = arrayPriority;
+					fp.proxyFn       = elemProxy;
+					fp.dtProxyFn     = 0;
+					fp.elementStride = elementStride;
+					flatProps.push_back(fp);
 				}
 			}
 			else
