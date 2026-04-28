@@ -592,6 +592,180 @@ namespace senddump
 		printf("[senddump] Wrote FLAT LISTS section\n");
 	}
 
+	// ── engine-authoritative flat list via CSendTablePrecalc ───────────────────
+	//
+	// Hypothesis (CS:S x64):
+	//   SendTable +0x18 = CSendTablePrecalc *m_pPrecalc
+	//   CSendTablePrecalc +0x00 = CUtlVector<const SendProp*> m_FlatProps
+	//     CUtlVector layout on x64:
+	//       +0x00 T*   m_pMemory
+	//       +0x08 int  m_nAllocationCount
+	//       +0x0C int  m_nGrowSize
+	//       +0x10 int  m_Size           (actual element count)
+	//
+	// ProbeSendTableLayout dumps raw bytes of SendTable + CSendTablePrecalc for a
+	// few tables (DT_CSPlayer etc.) so we can verify these offsets one more time.
+	constexpr std::uintptr_t kSendTablePrecalc        = 0x18;
+	constexpr std::uintptr_t kPrecalcFlatPropsMemory  = 0x00;
+	constexpr std::uintptr_t kPrecalcFlatPropsSize    = 0x10;
+
+	static bool g_stProbeDone = false;
+	void ProbeSendTableLayout(std::uintptr_t tableAddress, const std::string& tableName)
+	{
+		if (g_stProbeDone) return;
+		// Only probe a handful of well-known tables.
+		if (tableName != "DT_CSPlayer" && tableName != "DT_WORLD" && tableName != "DT_BaseAnimating")
+			return;
+
+		std::ofstream probe("sendtable_layout_probe.txt", std::ios::app);
+		if (!probe.is_open()) return;
+
+		probe << "\n=== SENDTABLE '" << tableName
+			<< "' addr=0x" << std::hex << tableAddress << std::dec << " ===\n";
+		for (std::size_t off = 0; off < 0x60; off += 8)
+		{
+			const auto asPtr = g_Memory.Read<std::uintptr_t>(tableAddress + off);
+			const auto asInt = g_Memory.Read<int>(tableAddress + off);
+			probe << "  +0x" << std::hex << std::setw(2) << std::setfill('0') << off
+				<< std::dec << std::setfill(' ')
+				<< "  ptr=0x" << std::hex << asPtr << std::dec
+				<< "  i32=" << asInt << "\n";
+		}
+
+		// Try to follow the precalc pointer and dump its first 0x80 bytes.
+		const auto precalcPtr = g_Memory.Read<std::uintptr_t>(tableAddress + kSendTablePrecalc);
+		if (precalcPtr)
+		{
+			probe << "  -> precalc @ 0x" << std::hex << precalcPtr << std::dec << "\n";
+			for (std::size_t off = 0; off < 0x80; off += 4)
+			{
+				const auto asInt  = g_Memory.Read<int>(precalcPtr + off);
+				const auto asUint = static_cast<std::uint32_t>(asInt);
+				const auto asPtr  = g_Memory.Read<std::uintptr_t>(precalcPtr + off);
+				probe << "    precalc+0x" << std::hex << std::setw(2) << std::setfill('0') << off
+					<< std::dec << std::setfill(' ')
+					<< "  i32=" << std::setw(10) << asInt
+					<< "  u32=0x" << std::hex << std::setw(8) << std::setfill('0') << asUint << std::setfill(' ')
+					<< "  ptr=0x" << asPtr
+					<< std::dec << "\n";
+			}
+		}
+		probe.close();
+	}
+
+	struct EngineFlatSlot
+	{
+		std::uintptr_t propAddress;
+		int   type;
+		int   flags;
+		int   bits;
+		float lowValue;
+		float highValue;
+		int   numElements;
+		std::string name;
+	};
+
+	// Read up to [cap] prop pointers from the precalc's m_FlatProps CUtlVector.
+	bool ReadEngineFlatProps(std::uintptr_t tableAddress, std::vector<EngineFlatSlot>& out, int& sizeOut)
+	{
+		const auto precalc = g_Memory.Read<std::uintptr_t>(tableAddress + kSendTablePrecalc);
+		if (!precalc) return false;
+
+		const auto arrayPtr = g_Memory.Read<std::uintptr_t>(precalc + kPrecalcFlatPropsMemory);
+		const int  size     = g_Memory.Read<int>(precalc + kPrecalcFlatPropsSize);
+		sizeOut = size;
+		if (!arrayPtr || size <= 0 || size > 8192) return false;
+
+		out.reserve(size);
+		for (int i = 0; i < size; ++i)
+		{
+			const auto slotAddr = arrayPtr + static_cast<std::size_t>(i) * sizeof(std::uintptr_t);
+			const auto propAddr = g_Memory.Read<std::uintptr_t>(slotAddr);
+			if (!propAddr) continue;
+
+			EngineFlatSlot s;
+			s.propAddress = propAddr;
+			s.type        = g_Memory.Read<int>(propAddr + kSendPropType);
+			s.flags       = g_Memory.Read<int>(propAddr + kSendPropFlags);
+			s.bits        = g_Memory.Read<int>(propAddr + kSendPropBits);
+			s.lowValue    = g_Memory.Read<float>(propAddr + kSendPropLowValue);
+			s.highValue   = g_Memory.Read<float>(propAddr + kSendPropHighValue);
+			s.numElements = g_Memory.Read<int>(propAddr + kSendPropNumElements);
+
+			const auto namePtr = g_Memory.Read<std::uintptr_t>(propAddr + kSendPropName);
+			s.name = g_Memory.ReadString(namePtr);
+			if (!IsValidReadString(s.name)) s.name = "?";
+
+			out.push_back(s);
+		}
+		return true;
+	}
+
+	void DumpEngineFlatLists(std::uintptr_t headAddress)
+	{
+		if (!headAddress) return;
+
+		std::ofstream out("sendtables_dump.txt", std::ios::app);
+		if (!out.is_open()) return;
+
+		out << "\n=== ENGINE FLAT LISTS (m_pPrecalc->m_FlatProps) ===\n";
+
+		std::vector<std::uintptr_t> classEntries;
+		for (auto current = headAddress; current; current = g_Memory.Read<std::uintptr_t>(current + kServerClassNext))
+		{
+			classEntries.push_back(current);
+			if (classEntries.size() > 4096) break;
+		}
+
+		int matchedCount = 0;
+		int totalCount   = 0;
+		for (const auto& cls : classEntries)
+		{
+			const auto classId     = g_Memory.Read<int>(cls + kServerClassClassId);
+			const auto tableAddr   = g_Memory.Read<std::uintptr_t>(cls + kServerClassTable);
+			const auto tableNamePtr = g_Memory.Read<std::uintptr_t>(tableAddr + kSendTableName);
+			const auto tableName   = g_Memory.ReadString(tableNamePtr);
+			if (!IsValidReadString(tableName)) continue;
+
+			ProbeSendTableLayout(tableAddr, tableName);
+
+			std::vector<EngineFlatSlot> slots;
+			int rawSize = 0;
+			const bool ok = ReadEngineFlatProps(tableAddr, slots, rawSize);
+
+			out << "ENGINE_FLAT " << tableName << " classid=" << classId
+				<< " reportedSize=" << rawSize
+				<< " readSize=" << slots.size()
+				<< " ok=" << (ok ? 1 : 0) << "\n";
+
+			if (!ok) continue;
+			++totalCount;
+
+			for (std::size_t i = 0; i < slots.size(); ++i)
+			{
+				const auto& s = slots[i];
+				out << "  eflat[" << i << "]"
+					<< " type=" << s.type
+					<< " flags=0x" << std::hex << (s.flags & ((1 << kSpropNumFlagBitsNetworked) - 1)) << std::dec
+					<< " bits=" << s.bits
+					<< " low=" << std::fixed << std::setprecision(9) << s.lowValue
+					<< " high=" << s.highValue
+					<< " nElements=" << s.numElements
+					<< " dotName=" << s.name
+					<< " addr=0x" << std::hex << s.propAddress << std::dec
+					<< "\n";
+			}
+			if (slots.size() > 0) ++matchedCount;
+		}
+
+		// Mark probe complete so subsequent runs don't re-probe (but we only ran once anyway).
+		g_stProbeDone = true;
+
+		out.close();
+		printf("[senddump] Wrote ENGINE FLAT LISTS (%d of %d classes had a precalc)\n",
+			matchedCount, totalCount);
+	}
+
 	void DumpClassIds(std::uintptr_t headAddress)
 	{
 		if (!headAddress)
@@ -1282,6 +1456,7 @@ int main(int argc, char* argv[]) {
 		const auto serverHead = senddump::FindServerClassHead();
 		senddump::DumpAllSendTables(serverHead);
 		senddump::DumpFlatLists(serverHead);
+		senddump::DumpEngineFlatLists(serverHead);
 		senddump::DumpClassIds(serverHead);
 	}
 
